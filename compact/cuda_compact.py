@@ -12,13 +12,22 @@ import ctypes
 import numba
 import numpy as np
 
+import cupy
+
 import warmup
 
-from cpu_compact import prefixsum, compact, any_mask
+from cpu_compact import prefixsum, cpu_compact, any_mask
+
+import cuda_utils
 
 
 WARP_SIZE = 32
 
+
+def _cupy_prefixsum(mask: cupy.ndarray):
+    out = cupy.cumsum(mask)
+    out -= mask
+    return out
 
 @cuda.jit([
     int8(int8[:]),
@@ -27,23 +36,43 @@ WARP_SIZE = 32
     int8(int8[:,:]),
     int8(int16[:,:]),
     int8(int32[:,:]),
-], device=True)
-def any(array):
+], cache=True, device=True)
+def any(d_array):
     ret = False
-    for i in range(array.shape[0]):
-        if array.ndim == 2:
-            for j in range(array.shape[1]):
-                if array[i][j] != 0:
+    for i in range(d_array.shape[0]):
+        if d_array.ndim == 2:
+            for j in range(d_array.shape[1]):
+                if d_array[i][j] != 0:
                     ret = True
-        elif array[i] != 0:
+        elif d_array[i] != 0:
             ret = True
+
     return ret
 
 
 @cuda.jit([
-    void(int8[:, :], int64[:])
+    void(int8[:, :], int8[:, :]),
+    void(int16[:, :], int8[:, :]),
+    void(int32[:, :], int8[:, :]),
+], cache=True)
+def _any_mask(d_array, d_mask):
+
+    idx = cuda.threadIdx.x + cuda.blockIdx.x * cuda.blockDim.x
+
+    if idx < d_array.shape[0]:
+        d_mask[idx] = any(d_array[idx])
+
+
+@cuda.jit([
+    void(int8[:], int64[:], int8[:, :]),
+    void(int8[:, :], int64[:], int8[:, :]),
+    void(int8[:, :, :], int64[:], int8[:, :]),
+    void(int16[:, :], int64[:], int8[:, :]),
+    void(int16[:, :, :], int64[:], int8[:, :]),
+    void(int32[:, :], int64[:], int8[:, :]),
+    void(int32[:, :, :], int64[:], int8[:, :])
 ])
-def block_offsets(d_array, b_offsets):
+def block_offsets(d_array, b_offsets, d_predicate):
 
     idx = cuda.threadIdx.x + cuda.blockIdx.x * cuda.blockDim.x
 
@@ -51,7 +80,7 @@ def block_offsets(d_array, b_offsets):
     b_id = cuda.blockIdx.x
 
     if (idx < d_array.shape[0]):
-        predicate = any(d_array[idx])
+        predicate = d_predicate[idx][0]
         # population of block
         count = cuda.syncthreads_count(predicate)
         if t_id == 0:
@@ -59,12 +88,13 @@ def block_offsets(d_array, b_offsets):
 
 
 @cuda.jit([
-    void(int8[:, :], int8[:, :], int64[:]),
-    void(int16[:, :], int16[:, :], int64[:]),
-    void(int32[:, :], int32[:, :], int64[:]),
-    void(int8[:, :, :], int8[:, :, :], int64[:]),
-])
-def _compact(d_array, d_out, b_offsets):
+    void(int8[:], int8[:], int64[:], int8[:, :]),
+    void(int8[:, :], int8[:, :], int64[:], int8[:, :]),
+    void(int16[:, :], int16[:, :], int64[:], int8[:, :]),
+    void(int32[:, :], int32[:, :], int64[:], int8[:, :]),
+    void(int8[:, :, :], int8[:, :, :], int64[:], int8[:, :]),
+], cache=True)
+def _compact(d_array, d_out, b_offsets, d_predicate):
 
     idx = cuda.threadIdx.x + cuda.blockIdx.x * cuda.blockDim.x
 
@@ -84,7 +114,7 @@ def _compact(d_array, d_out, b_offsets):
 
         lane = t_id % WARP_SIZE
 
-        predicate = any(d_array[idx])
+        predicate = d_predicate[idx][0]
 
         prefix_mask = ~(~0 << lane)
 
@@ -124,83 +154,123 @@ def _compact(d_array, d_out, b_offsets):
         if predicate:
             target_idx = t_pop + warp_counts[w_id] + b_offsets[b_id]
 
-            if d_array.ndim == 1:
-                d_out[target_idx] = d_array[idx]
-            else:
-                for i in range(d_array.shape[1]):
-                    if d_array.ndim == 3:
-                        for j in range(d_array.shape[2]):
-                            d_out[target_idx][i][j] = d_array[idx][i][j]
-                    else:
-                        d_out[target_idx][i] = d_array[idx][i]
+            cuda_utils.setitem(d_out, target_idx, d_array[idx])
 
 
-
-def gpu_compact(array):
-
-    # host spends 6 ms on an array of size 10,000,000
-    # 2 ms to launch kernel
+def _np_compact(
+    array, 
+    mask: optional(int8[:, :]) = None,
+):
+    array_length = array.shape[0]
 
     block_size = 64
-    blocks = -(array.shape[0] // -block_size)
-
-    out = np.empty_like(array, dtype=array.dtype)
+    blocks = -(array_length // -block_size)
 
     offsets = np.zeros((blocks,), dtype="int64")
 
-    # allocate device arrays
     d_array = cuda.to_device(array)
-    d_out = cuda.device_array_like(array)
+
     b_offsets = cuda.device_array((blocks,), dtype="int64")
 
-    t = time.time()
+    if mask is None:
+        d_mask = cuda.device_array((array_length, 1), dtype="int8")
+        _any_mask[blocks, block_size](d_array, d_mask)
+    else:
+        mask = np.reshape(mask, (mask.shape[0], 1))
+        d_mask = cuda.to_device(mask)
 
-    block_offsets[blocks, block_size](d_array, b_offsets)
-
-    print("kernel 1 execution time: " + str((time.time() - t) * 1000) + "ms")
+    block_offsets[blocks, block_size](d_array, b_offsets, d_mask)
 
     b_offsets.copy_to_host(offsets)
     
     length = np.sum(offsets)
 
+    d_out = cuda.device_array((length, *array.shape[1:]), dtype=array.dtype)
+
     offsets = prefixsum(offsets)
 
     b_offsets = cuda.to_device(offsets)
 
-    t = time.time()
+    _compact[blocks, block_size](d_array, d_out, b_offsets, d_mask)
 
-    _compact[blocks, block_size](d_array, d_out, b_offsets)
-
-    print("kernel 2 execution time: " + str((time.time() - t) * 1000) + "ms")
+    out = np.empty_like(d_out, dtype=array.dtype)
 
     # move data to host
     d_out.copy_to_host(out)
     b_offsets.copy_to_host(offsets)
 
-    # deallocate device array
-    d_out = None
-
-    print("length", length)
-
-    shape = (length, *out.shape[1:])
-
-    # resize to ignore trailing zeros
-    out.resize(shape)
-
     return out
 
-def test():
-    x = np.array([[1],[0],[2],[0],[3],[4],[5],[0],], dtype="int8")
+@profile
+def _device_compact(
+    d_array, 
+    d_mask,
+):
+    array_length = d_array.shape[0]
 
-    x = np.repeat(x, 2000000000, axis=0)
+    block_size = 512
+    blocks = -(array_length // -block_size)
 
-    t = time.time()
-    y = gpu_compact(x)
-    print("total execution time (gpu): " + str((time.time() - t) * 1000) + "ms")
+    b_offsets = cuda.device_array((blocks,), dtype="int64")
 
-    t = time.time()
-    z = compact(x, mask=any_mask(x))
-    print("total execution time (cpu): " + str((time.time() - t) * 1000) + "ms")
+    if d_mask is None:
+        d_mask = cuda.device_array((array_length, 1), dtype="int8")
+        _any_mask[blocks, block_size](d_array, d_mask)
+    else:
+        d_mask = d_mask.reshape((d_mask.shape[0], 1))
+
+    block_offsets[blocks, block_size](d_array, b_offsets, d_mask)
+
+    if d_array.size < 1000000:
+        # numpy scan
+        offsets = np.empty((blocks,), dtype="int64")
+        b_offsets.copy_to_host(offsets)
+        length = np.sum(offsets)
+        offsets = prefixsum(offsets)
+        b_offsets = cuda.to_device(offsets)
+    else:
+        # cupy scan
+        cupy_b_offsets = cupy.asarray(b_offsets)
+        b_offsets_psum = _cupy_prefixsum(cupy_b_offsets)
+        length = int(b_offsets_psum[-1] + b_offsets[-1])
+        b_offsets = b_offsets_psum
+
+    d_out = cuda.device_array((length, *d_array.shape[1:]), dtype=d_array.dtype)
+
+    _compact[blocks, block_size](d_array, d_out, b_offsets, d_mask)
+
+    return d_out
 
 
-    assert np.allclose(y, z)
+def gpu_compact(
+    array, 
+    mask: optional(int8[:, :]) = None,
+):
+    if cuda.is_cuda_array(array):
+        return _device_compact(array, mask)
+    elif isinstance(array, np.ndarray):
+        return _np_compact(array, mask)
+    else:
+        raise Exception("gpu_compact: input must be array or device array")
+
+
+def test(n):
+    x = np.array([[1],[0],[2],[0],[3],[4],[5],[0],[0],[6]], dtype="int8")
+
+    x = np.repeat(x, n // 10, axis=0)
+
+    d_x = cuda.to_device(x)
+
+    y = gpu_compact(d_x)
+
+    t = time.perf_counter()
+    for i in range(10):
+        y = gpu_compact(d_x)
+    print("total execution time (gpu): " + str((time.perf_counter() - t) * 1000 / 10) + "ms")
+
+
+    t = time.perf_counter()
+    z = cpu_compact(x, mask=any_mask(x))
+    print("total execution time (cpu): " + str((time.perf_counter() - t) * 1000) + "ms")
+
+    assert np.allclose(np.array(y), z)
